@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Family Search Safety Alert — Your Alerts</title>
+  <style>
+    :root {
+      --navy: #0F3057; --teal: #007EA7; --accent: #F4A261;
+      --muted: #5C6B73; --ice: #CFE3F0; --bg: #F7FAFC;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      margin: 0; min-height: 100vh; color: #222; background: var(--bg);
+    }
+    header {
+      background: var(--navy); color: #fff; padding: 26px 32px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    header .title { display: flex; align-items: center; gap: 12px; }
+    header .icon-circle {
+      width: 38px; height: 38px; border-radius: 50%; background: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+    }
+    header .icon-circle svg { width: 20px; height: 20px; }
+    header h1 { font-size: 18px; margin: 0; }
+    header .email { font-size: 12.5px; color: var(--ice); margin-top: 2px; }
+    header a.back { color: var(--ice); font-size: 13px; text-decoration: none; }
+    header a.back:hover { text-decoration: underline; }
+
+    main { max-width: 760px; margin: 0 auto; padding: 32px 20px 60px; }
+
+    .empty {
+      background: #fff; border-radius: 14px; padding: 50px 30px; text-align: center;
+      color: var(--muted); box-shadow: 0 6px 20px rgba(15,48,87,.08);
+    }
+    .empty .icon-circle {
+      width: 54px; height: 54px; border-radius: 50%; background: var(--ice);
+      display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;
+    }
+    .empty .icon-circle svg { width: 26px; height: 26px; }
+
+    .alert-card {
+      background: #fff; border-radius: 14px; padding: 20px 24px; margin-bottom: 14px;
+      box-shadow: 0 6px 20px rgba(15,48,87,.08);
+      animation: cardIn 0.4s ease both;
+      display: flex; gap: 16px; align-items: flex-start;
+    }
+    @keyframes cardIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    .alert-card .icon-circle {
+      width: 42px; height: 42px; min-width: 42px; border-radius: 50%; background: var(--navy);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .alert-card .icon-circle svg { width: 20px; height: 20px; }
+    .alert-card .content { flex: 1; }
+    .alert-card .top-row {
+      display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px;
+    }
+    .alert-card .device { font-weight: 700; color: var(--navy); font-size: 14.5px; }
+    .alert-card .time { font-size: 12px; color: var(--muted); }
+    .alert-card .query {
+      margin-top: 8px; font-style: italic; color: #333; font-size: 13.5px;
+      background: #f3f7fa; border-left: 3px solid var(--teal); padding: 8px 12px; border-radius: 6px;
+    }
+
+    #status-msg { text-align: center; color: var(--muted); font-size: 13.5px; padding: 30px 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <div class="icon-circle">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#0F3057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2 3 6v6c0 5 3.8 8.7 9 10 5.2-1.3 9-5 9-10V6l-9-4Z"></path>
+        </svg>
+      </div>
+      <div>
+        <h1>Your Alerts</h1>
+        <div class="email" id="emailLabel"></div>
+      </div>
+    </div>
+    <a class="back" href="index.html">&larr; Switch email</a>
+  </header>
+
+  <main>
+    <div id="status-msg">Loading alerts…</div>
+    <div id="list"></div>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const email = params.get('email') || '';
+    document.getElementById('emailLabel').textContent = email;
+
+    function timeAgo(iso) {
+      const d = new Date(iso);
+      if (isNaN(d)) return iso;
+      return d.toLocaleString();
+    }
+
+    async function load() {
+      const statusEl = document.getElementById('status-msg');
+      const listEl = document.getElementById('list');
+      if (!email) {
+        statusEl.textContent = 'No email provided.';
+        return;
+      }
+      try {
+        const res = await fetch('/api/alerts?email=' + encodeURIComponent(email));
+        const data = await res.json();
+        const alerts = data.alerts || [];
+
+        if (alerts.length === 0) {
+          statusEl.style.display = 'none';
+          listEl.innerHTML = `
+            <div class="empty">
+              <div class="icon-circle">
+                <svg viewBox="0 0 24 24" fill="none" stroke="#0F3057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+                  <polyline points="22 4 12 14.01 9 11.01"></polyline>
+                </svg>
+              </div>
+              <div>No alerts yet for this email. That's a good thing.</div>
+            </div>`;
+          return;
+        }
+
+        statusEl.style.display = 'none';
+        listEl.innerHTML = alerts.map(a => `
+          <div class="alert-card">
+            <div class="icon-circle">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+              </svg>
+            </div>
+            <div class="content">
+              <div class="top-row">
+                <div class="device">${a.deviceOwnerLabel || 'Unknown device'}</div>
+                <div class="time">${timeAgo(a.timestamp)}</div>
+              </div>
+              ${a.searchQuery ? `<div class="query">"${a.searchQuery}"</div>` : ''}
+            </div>
+          </div>
+        `).join('');
+      } catch (err) {
+        statusEl.textContent = 'Could not load alerts. Is the backend running?';
+      }
+    }
+
+    load();
+  </script>
+</body>
+</html>

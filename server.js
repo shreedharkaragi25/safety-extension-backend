@@ -1,0 +1,115 @@
+import express from "express";
+import cors from "cors";
+import nodemailer from "nodemailer";
+import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use("/dashboard", express.static(path.join(__dirname, "dashboard")));
+
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+const lastSent = new Map();
+const MIN_INTERVAL_MS = 2 * 60 * 1000;
+
+// --- Simple JSON-file alert history store ---
+// Demo-grade persistence (a real product would use a proper database).
+const STORE_PATH = path.join(__dirname, "alerts.json");
+
+function loadAlerts() {
+  try {
+    const raw = fs.readFileSync(STORE_PATH, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+function saveAlert(record) {
+  const alerts = loadAlerts();
+  alerts.unshift(record); // newest first
+  try {
+    fs.writeFileSync(STORE_PATH, JSON.stringify(alerts, null, 2));
+  } catch (err) {
+    console.error("Failed to persist alert history:", err);
+  }
+}
+
+app.post("/alert", async (req, res) => {
+  const { contactEmail, deviceOwnerLabel, timestamp, searchQuery } = req.body || {};
+
+  if (!contactEmail) {
+    return res.status(400).json({ error: "contactEmail is required" });
+  }
+
+  const now = Date.now();
+  const last = lastSent.get(contactEmail);
+  if (last && now - last < MIN_INTERVAL_MS) {
+    return res.status(200).json({ ok: true, note: "throttled" });
+  }
+  lastSent.set(contactEmail, now);
+
+  const deviceLine = deviceOwnerLabel ? ` on "${deviceOwnerLabel}"` : "";
+  const queryLine = searchQuery ? `\nSearch: "${searchQuery}"\n` : "";
+
+  try {
+    await transporter.sendMail({
+      from: process.env.ALERT_FROM_EMAIL || "safety-alerts@example.com",
+      to: contactEmail,
+      subject: "Check-in: a concerning search was detected",
+      text:
+        `A search suggesting possible distress was made${deviceLine} at ${timestamp}.\n` +
+        queryLine +
+        `\nThis is an automated check-in prompt, not a diagnosis. Consider reaching out ` +
+        `directly and gently to check how they're doing.\n\n` +
+        `Support resources: https://findahelpline.com`
+    });
+
+    saveAlert({
+      contactEmail,
+      deviceOwnerLabel: deviceOwnerLabel || "",
+      timestamp: timestamp || new Date().toISOString(),
+      searchQuery: searchQuery || ""
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Email send failed:", err);
+    res.status(500).json({ error: "failed to send alert" });
+  }
+});
+
+// Dashboard API: alert history for a given trusted-contact email.
+// NOTE: this is demo-grade — anyone who knows the email can view its
+// history. A real product needs proper authentication (e.g. a magic link
+// sent to that email, or full account login) before this data is shown.
+app.get("/api/alerts", (req, res) => {
+  const email = (req.query.email || "").toString().trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "email query param is required" });
+  const alerts = loadAlerts().filter(
+    (a) => (a.contactEmail || "").toLowerCase() === email
+  );
+  res.json({ alerts });
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Safety alert backend listening on :${PORT}`));
