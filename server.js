@@ -62,6 +62,7 @@ app.post("/alert", async (req, res) => {
   const now = Date.now();
   const last = lastSent.get(contactEmail);
   if (last && now - last < MIN_INTERVAL_MS) {
+    console.log(`Throttled alert for ${contactEmail} (too soon after last one)`);
     return res.status(200).json({ ok: true, note: "throttled" });
   }
   lastSent.set(contactEmail, now);
@@ -81,7 +82,8 @@ app.post("/alert", async (req, res) => {
         `directly and gently to check how they're doing.\n\n` +
         `Support resources: https://findahelpline.com`
     });
-
+   
+    console.log(`Saving new alert for ${contactEmail}: "${searchQuery}"`);
     saveAlert({
       contactEmail,
       deviceOwnerLabel: deviceOwnerLabel || "",
