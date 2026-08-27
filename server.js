@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import nodemailer from "nodemailer";
+import { Resend } from "resend";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
@@ -16,16 +16,7 @@ app.use(cors());
 app.use(express.json());
 app.use("/dashboard", express.static(path.join(__dirname, "dashboard")));
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
-
+const resend = new Resend(process.env.RESEND_API_KEY);
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 2 * 60 * 1000;
 
@@ -71,8 +62,8 @@ app.post("/alert", async (req, res) => {
   const queryLine = searchQuery ? `\nSearch: "${searchQuery}"\n` : "";
 
   try {
-    await transporter.sendMail({
-      from: process.env.ALERT_FROM_EMAIL || "safety-alerts@example.com",
+          await resend.emails.send({
+      from: "onboarding@resend.dev",
       to: contactEmail,
       subject: "Check-in: a concerning search was detected",
       text:
