@@ -15,9 +15,6 @@ const DEFAULT_SETTINGS = {
 const CONCERN_PATTERNS = [
   /\bsuicide\b/i,
   /\bkill myself\b/i,
-  /\bnidhi\b/i,
-  /\blove\b/i,
-  /\bkavan\b/i,
   /\bend my life\b/i,
   /\bwant to die\b/i,
   /\bpainless (way to )?die\b/i,
@@ -109,14 +106,13 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
   // Then notify the trusted contact.
   await sendAlert(query, settings);
 
-  if (settings.transparencyMode) {
-    chrome.notifications.create({
-      type: "basic",
-      iconUrl: "icon48.png",
-      title: "Check-in sent",
-      message:
-        "This device is set up to let a trusted contact know when a search like this happens, so they were notified.",
-      priority: 1
-    });
-  }
+    // Disclosure is always shown — this is not optional, by design.
+  chrome.notifications.create({
+    type: "basic",
+    iconUrl: "icon48.png",
+    title: "Check-in sent",
+    message:
+      "This device is set up to let a trusted contact know when a search like this happens, so they were notified.",
+    priority: 1
+  });
 });

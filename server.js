@@ -44,7 +44,8 @@ function saveAlert(record) {
 }
 
 app.post("/alert", async (req, res) => {
-  const { contactEmail, deviceOwnerLabel, timestamp, searchQuery } = req.body || {};
+  const { contactEmail, deviceOwnerLabel, timestamp, searchQuery, location, mapLink } = req.body || {};
+  console.log("Received location:", location, "mapLink:", mapLink);
 
   if (!contactEmail) {
     return res.status(400).json({ error: "contactEmail is required" });
@@ -60,26 +61,30 @@ app.post("/alert", async (req, res) => {
 
   const deviceLine = deviceOwnerLabel ? ` on "${deviceOwnerLabel}"` : "";
   const queryLine = searchQuery ? `\nSearch: "${searchQuery}"\n` : "";
+  const locationLine = mapLink ? `\nApproximate location: ${mapLink}\n` : "";
 
   try {
-          await resend.emails.send({
+    await resend.emails.send({
       from: "onboarding@resend.dev",
       to: contactEmail,
       subject: "Check-in: a concerning search was detected",
       text:
         `A search suggesting possible distress was made${deviceLine} at ${timestamp}.\n` +
         queryLine +
+        locationLine +
         `\nThis is an automated check-in prompt, not a diagnosis. Consider reaching out ` +
         `directly and gently to check how they're doing.\n\n` +
         `Support resources: https://findahelpline.com`
     });
-   
+
     console.log(`Saving new alert for ${contactEmail}: "${searchQuery}"`);
     saveAlert({
       contactEmail,
       deviceOwnerLabel: deviceOwnerLabel || "",
       timestamp: timestamp || new Date().toISOString(),
-      searchQuery: searchQuery || ""
+      searchQuery: searchQuery || "",
+      location: location || null,
+      mapLink: mapLink || ""
     });
 
     res.json({ ok: true });
