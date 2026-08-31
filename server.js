@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import cors from "cors";
 import { Resend } from "resend";
 import dotenv from "dotenv";
@@ -15,8 +15,6 @@ app.use("/dashboard", express.static(path.join(__dirname, "dashboard")));
 const resend = new Resend(process.env.RESEND_API_KEY);
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 2 * 60 * 1000;
-// --- Simple JSON-file alert history store ---
-// Demo-grade persistence (a real product would use a proper database).
 const STORE_PATH = path.join(__dirname, "alerts.json");
 function loadAlerts() {
   try {
@@ -28,7 +26,7 @@ function loadAlerts() {
 }
 function saveAlert(record) {
   const alerts = loadAlerts();
-  alerts.unshift(record); // newest first
+  alerts.unshift(record);
   try {
     fs.writeFileSync(STORE_PATH, JSON.stringify(alerts, null, 2));
   } catch (err) {
@@ -64,3 +62,71 @@ app.post("/alert", async (req, res) => {
       to: contactEmail,
       subject: subjectLine,
       text:
+        `A search suggesting possible distress was made${deviceLine} at ${timestamp}.\n` +
+        queryLine +
+        urgencyLine +
+        locationLine +
+        `\nThis is an automated check-in prompt, not a diagnosis. Consider reaching out ` +
+        `directly and gently to check how they're doing.\n\n` +
+        `Support resources: https://findahelpline.com`
+    });
+    console.log(`Saving new alert for ${contactEmail}: "${searchQuery}"`);
+    saveAlert({
+      contactEmail,
+      deviceOwnerLabel: deviceOwnerLabel || "",
+      timestamp: timestamp || new Date().toISOString(),
+      searchQuery: searchQuery || "",
+      location: location || null,
+      mapLink: mapLink || "",
+      severity: severity || "unknown"
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Email send failed:", err);
+    res.status(500).json({ error: "failed to send alert" });
+  }
+});
+app.get("/api/alerts", (req, res) => {
+  const email = (req.query.email || "").toString().trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "email query param is required" });
+  const alerts = loadAlerts().filter(
+    (a) => (a.contactEmail || "").toLowerCase() === email
+  );
+  res.json({ alerts });
+});
+app.get("/uninstall-alert", async (req, res) => {
+  const email = (req.query.email || "").toString().trim();
+  const email2 = (req.query.email2 || "").toString().trim();
+  const device = (req.query.device || "").toString().trim();
+  const recipients = [email, email2].filter(Boolean);
+
+  for (const to of recipients) {
+    try {
+      await resend.emails.send({
+        from: "onboarding@resend.dev",
+        to,
+        subject: "Safety extension was removed",
+        text:
+          `The Family Search Safety Alert extension was just removed${device ? ` from "${device}"` : ""}.\n\n` +
+          `This device will no longer send check-in alerts. Consider reaching out to check in.`
+      });
+      console.log(`Sent uninstall alert to ${to}`);
+      saveAlert({
+        contactEmail: to,
+        deviceOwnerLabel: device,
+        timestamp: new Date().toISOString(),
+        searchQuery: "(extension removed)",
+        location: null,
+        mapLink: "",
+        severity: "uninstall"
+      });
+    } catch (err) {
+      console.error("Uninstall alert email failed:", err);
+    }
+  }
+
+  res.send("OK");
+});
+app.get("/health", (_req, res) => res.json({ ok: true }));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Safety alert backend listening on :${PORT}`));
