@@ -13,6 +13,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use("/dashboard", express.static(path.join(__dirname, "dashboard")));
+app.use("/family-dashboard", express.static(path.join(__dirname, "family-dashboard")));
 const resend = new Resend(process.env.RESEND_API_KEY);
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 2 * 60 * 1000;
