@@ -244,6 +244,64 @@ app.get("/uninstall-alert", async (req, res) => {
   }
   res.send("OK");
 });
+// --- Concern phrase patterns (remotely updatable) ---
+const PATTERNS_PATH = path.join(__dirname, "patterns.json");
+const DEFAULT_PATTERNS = [
+  { phrase: "suicide", severity: "crisis", lang: "en" },
+  { phrase: "kill myself", severity: "crisis", lang: "en" },
+  { phrase: "end my life", severity: "crisis", lang: "en" },
+  { phrase: "want to die", severity: "crisis", lang: "en" },
+  { phrase: "painless way to die", severity: "crisis", lang: "en" },
+  { phrase: "how to die", severity: "crisis", lang: "en" },
+  { phrase: "self harm", severity: "crisis", lang: "en" },
+  { phrase: "no reason to live", severity: "crisis", lang: "en" },
+  { phrase: "better off dead", severity: "crisis", lang: "en" },
+  { phrase: "wish i was dead", severity: "crisis", lang: "en" },
+  { phrase: "i have depression", severity: "moderate", lang: "en" },
+  { phrase: "feeling depressed", severity: "moderate", lang: "en" },
+  { phrase: "nothing matters anymore", severity: "moderate", lang: "en" },
+  { phrase: "hopeless", severity: "moderate", lang: "en" },
+  { phrase: "panic attack", severity: "moderate", lang: "en" },
+  { phrase: "आत्महत्या", severity: "crisis", lang: "hi" },
+  { phrase: "खुदकुशी", severity: "crisis", lang: "hi" },
+  { phrase: "मरना चाहता हूं", severity: "crisis", lang: "hi" },
+  { phrase: "aatmahatya", severity: "crisis", lang: "hi-en" },
+  { phrase: "marna chahta hoon", severity: "crisis", lang: "hi-en" },
+  { phrase: "bahut udaas", severity: "moderate", lang: "hi-en" },
+  { phrase: "ಆತ್ಮಹತ್ಯೆ", severity: "crisis", lang: "kn" },
+  { phrase: "aatmahatye", severity: "crisis", lang: "kn-en" },
+  { phrase: "தற்கொலை", severity: "crisis", lang: "ta" },
+  { phrase: "tharkolai", severity: "crisis", lang: "ta-en" }
+];
+function loadPatterns() {
+  try {
+    return JSON.parse(fs.readFileSync(PATTERNS_PATH, "utf-8"));
+  } catch {
+    // First run: seed the file so it's editable going forward without touching code.
+    fs.writeFileSync(PATTERNS_PATH, JSON.stringify(DEFAULT_PATTERNS, null, 2));
+    return DEFAULT_PATTERNS;
+  }
+}
+
+app.get("/api/patterns", (_req, res) => {
+  res.json({ patterns: loadPatterns(), updatedAt: new Date().toISOString() });
+});
+
+// --- Family devices (no session needed — the family code itself is the shared secret the app already has) ---
+app.get("/api/devices", (req, res) => {
+  const familyId = (req.query.familyId || "").toString().trim().toUpperCase();
+  if (!familyId) return res.status(400).json({ error: "familyId query param is required" });
+  const alerts = loadAlerts().filter((a) => (a.familyId || "").toUpperCase() === familyId);
+  const deviceMap = new Map();
+  alerts.forEach((a) => {
+    const key = a.deviceOwnerLabel || "(unlabeled device)";
+    if (!deviceMap.has(key)) deviceMap.set(key, { deviceOwnerLabel: key, alertCount: 0, lastSeen: a.timestamp });
+    const entry = deviceMap.get(key);
+    entry.alertCount += 1;
+    if (a.timestamp > entry.lastSeen) entry.lastSeen = a.timestamp;
+  });
+  res.json({ familyId, devices: Array.from(deviceMap.values()) });
+});
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 const PORT = process.env.PORT || 3000;
