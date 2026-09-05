@@ -287,6 +287,23 @@ app.get("/api/patterns", (_req, res) => {
   res.json({ patterns: loadPatterns(), updatedAt: new Date().toISOString() });
 });
 
+app.post("/api/patterns", (req, res) => {
+  const { phrase, severity, lang } = req.body || {};
+  if (!phrase || typeof phrase !== "string" || !phrase.trim()) {
+    return res.status(400).json({ error: "phrase is required" });
+  }
+  const validSeverities = ["crisis", "moderate"];
+  const finalSeverity = validSeverities.includes(severity) ? severity : "moderate";
+  const patterns = loadPatterns();
+  patterns.push({
+    phrase: phrase.trim(),
+    severity: finalSeverity,
+    lang: lang || "en",
+  });
+  fs.writeFileSync(PATTERNS_PATH, JSON.stringify(patterns, null, 2));
+  res.json({ ok: true, patterns });
+});
+
 // --- Family devices (no session needed — the family code itself is the shared secret the app already has) ---
 app.get("/api/devices", (req, res) => {
   const familyId = (req.query.familyId || "").toString().trim().toUpperCase();
