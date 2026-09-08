@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import { Resend } from "resend";
 import dotenv from "dotenv";
@@ -35,6 +35,53 @@ function saveAlert(record) {
     fs.writeFileSync(STORE_PATH, JSON.stringify(alerts, null, 2));
   } catch (err) {
     console.error("Failed to persist alert history:", err);
+  }
+}
+
+// --- Groq-based risk classification (confirms/refines the on-device regex match) ---
+async function classifyRisk(searchQuery) {
+  if (!searchQuery) return { confirmedSeverity: "unknown", reason: "no query provided" };
+  try {
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You classify search queries for a family safety app. Given a search query, respond with ONLY a JSON object like " +
+              '{"severity": "none|low|moderate|crisis", "reason": "short explanation"}. ' +
+              "Classify 'crisis' only for genuine, specific expressions of suicidal intent or self-harm intent. " +
+              "Classify as 'low' or 'none' for research, news, school projects, song lyrics, or unrelated context that merely contains a matched phrase. " +
+              "Classify 'moderate' for expressions of distress, sadness, or anxiety without explicit self-harm intent.",
+          },
+          { role: "user", content: `Search query: "${searchQuery}"` },
+        ],
+        temperature: 0,
+        max_tokens: 150,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("Groq API error:", response.status, await response.text());
+      return { confirmedSeverity: "unknown", reason: "classification failed" };
+    }
+
+    const data = await response.json();
+    const raw = data.choices?.[0]?.message?.content?.trim() || "{}";
+    const parsed = JSON.parse(raw);
+    return {
+      confirmedSeverity: parsed.severity || "unknown",
+      reason: parsed.reason || "",
+    };
+  } catch (err) {
+    console.error("classifyRisk failed:", err);
+    return { confirmedSeverity: "unknown", reason: "classification error" };
   }
 }
 
@@ -166,6 +213,8 @@ app.post("/alert", async (req, res) => {
   const deviceLine = deviceOwnerLabel ? ` on "${deviceOwnerLabel}"` : "";
   const queryLine = searchQuery ? `\nSearch: "${searchQuery}"\n` : "";
   const locationLine = mapLink ? `\nApproximate location: ${mapLink}\n` : "";
+  const classification = await classifyRisk(searchQuery);
+  console.log(`Groq classification for "${searchQuery}": ${classification.confirmedSeverity} (${classification.reason})`);
   const isCrisis = severity === "crisis";
   const subjectLine = isCrisis
     ? "Check-in: a concerning search was detected"
@@ -195,6 +244,8 @@ app.post("/alert", async (req, res) => {
       location: location || null,
       mapLink: mapLink || "",
       severity: severity || "unknown",
+      confirmedSeverity: classification.confirmedSeverity,
+      confirmationReason: classification.reason,
       familyId: familyId || null,
     });
     res.json({ ok: true });
