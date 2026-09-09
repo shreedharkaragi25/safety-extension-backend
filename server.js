@@ -85,6 +85,49 @@ async function classifyRisk(searchQuery) {
   }
 }
 
+// --- Vapi call trigger (only fires on confirmed crisis-level risk) ---
+async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedContactName) {
+  if (!devicePhoneNumber) {
+    console.log("No devicePhoneNumber provided, skipping Vapi call trigger.");
+    return { skipped: true, reason: "no device phone number" };
+  }
+  try {
+    const response = await fetch("https://api.vapi.ai/call", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.VAPI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        assistantId: process.env.VAPI_ASSISTANT_ID,
+        customer: {
+          number: devicePhoneNumber,
+        },
+        assistantOverrides: {
+          variableValues: {
+            counselorName: counselorPhone ? "your counselor" : "",
+            counselorPhone: counselorPhone || "",
+            trustedContactName: trustedContactName || "your trusted contact",
+          },
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Vapi call trigger failed:", response.status, errText);
+      return { skipped: false, error: errText };
+    }
+
+    const data = await response.json();
+    console.log("Vapi call triggered successfully:", data.id || data);
+    return { skipped: false, callId: data.id };
+  } catch (err) {
+    console.error("triggerWellbeingCall failed:", err);
+    return { skipped: false, error: err.message };
+  }
+}
+
 // --- Family store ---
 const FAMILIES_PATH = path.join(__dirname, "families.json");
 function loadFamilies() {
@@ -216,6 +259,14 @@ app.post("/alert", async (req, res) => {
   const classification = await classifyRisk(searchQuery);
   console.log(`Groq classification for "${searchQuery}": ${classification.confirmedSeverity} (${classification.reason})`);
   const isCrisis = severity === "crisis";
+
+  if (classification.confirmedSeverity === "crisis") {
+    const { devicePhoneNumber, counselorPhone } = req.body || {};
+    triggerWellbeingCall(devicePhoneNumber, counselorPhone, "your trusted contact")
+      .then((result) => console.log("Call trigger result:", result))
+      .catch((err) => console.error("Call trigger threw:", err));
+  }
+
   const subjectLine = isCrisis
     ? "Check-in: a concerning search was detected"
     : "Check-in: a search suggesting possible stress was detected";
