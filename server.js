@@ -5,6 +5,7 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import Razorpay from "razorpay";
 import { fileURLToPath } from "url";
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -18,6 +19,11 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 2 * 60 * 1000;
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me-in-render";
+
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 // --- Alert history store ---
 const STORE_PATH = path.join(__dirname, "alerts.json");
@@ -38,6 +44,40 @@ function saveAlert(record) {
   }
 }
 
+// --- Wallet store (per family) ---
+const WALLETS_PATH = path.join(__dirname, "wallets.json");
+const CALL_COST_PAISE = 500; // ₹5 per wellbeing call, adjust as needed
+
+function loadWallets() {
+  try {
+    return JSON.parse(fs.readFileSync(WALLETS_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function saveWallets(wallets) {
+  fs.writeFileSync(WALLETS_PATH, JSON.stringify(wallets, null, 2));
+}
+function getBalance(familyId) {
+  const wallets = loadWallets();
+  return wallets[familyId]?.balancePaise || 0;
+}
+function creditWallet(familyId, amountPaise) {
+  const wallets = loadWallets();
+  if (!wallets[familyId]) wallets[familyId] = { balancePaise: 0 };
+  wallets[familyId].balancePaise += amountPaise;
+  saveWallets(wallets);
+  return wallets[familyId].balancePaise;
+}
+function debitWallet(familyId, amountPaise) {
+  const wallets = loadWallets();
+  const current = wallets[familyId]?.balancePaise || 0;
+  if (current < amountPaise) return { ok: false, balancePaise: current };
+  wallets[familyId].balancePaise = current - amountPaise;
+  saveWallets(wallets);
+  return { ok: true, balancePaise: wallets[familyId].balancePaise };
+}
+
 // --- Groq-based risk classification (confirms/refines the on-device regex match) ---
 async function classifyRisk(searchQuery) {
   if (!searchQuery) return { confirmedSeverity: "unknown", reason: "no query provided" };
@@ -49,7 +89,7 @@ async function classifyRisk(searchQuery) {
         "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
       },
       body: JSON.stringify({
-               model: "openai/gpt-oss-20b",
+        model: "openai/gpt-oss-20b",
         messages: [
           {
             role: "system",
@@ -85,12 +125,21 @@ async function classifyRisk(searchQuery) {
   }
 }
 
-// --- Vapi call trigger (only fires on confirmed crisis-level risk) ---
-async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedContactName) {
+// --- Vapi call trigger (only fires on confirmed crisis-level risk AND sufficient wallet balance) ---
+async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedContactName, familyId) {
   if (!devicePhoneNumber) {
     console.log("No devicePhoneNumber provided, skipping Vapi call trigger.");
     return { skipped: true, reason: "no device phone number" };
   }
+
+  if (familyId) {
+    const debit = debitWallet(familyId, CALL_COST_PAISE);
+    if (!debit.ok) {
+      console.log(`Insufficient wallet balance for family ${familyId}, skipping call. Balance: ${debit.balancePaise} paise`);
+      return { skipped: true, reason: "insufficient wallet balance", balancePaise: debit.balancePaise };
+    }
+  }
+
   try {
     const response = await fetch("https://api.vapi.ai/call", {
       method: "POST",
@@ -116,6 +165,8 @@ async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedCo
     if (!response.ok) {
       const errText = await response.text();
       console.error("Vapi call trigger failed:", response.status, errText);
+      // Refund since the call didn't actually go through
+      if (familyId) creditWallet(familyId, CALL_COST_PAISE);
       return { skipped: false, error: errText };
     }
 
@@ -124,6 +175,7 @@ async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedCo
     return { skipped: false, callId: data.id };
   } catch (err) {
     console.error("triggerWellbeingCall failed:", err);
+    if (familyId) creditWallet(familyId, CALL_COST_PAISE);
     return { skipped: false, error: err.message };
   }
 }
@@ -237,8 +289,59 @@ app.get("/api/family/summary", (req, res) => {
     familyName: family.familyName,
     familyId: family.familyId,
     devices: Array.from(deviceMap.values()),
+    walletBalancePaise: getBalance(familyId),
     alerts,
   });
+});
+
+// --- Wallet endpoints ---
+app.post("/api/wallet/create-order", async (req, res) => {
+  const { familyId, amountRupees } = req.body || {};
+  if (!familyId || !amountRupees || amountRupees <= 0) {
+    return res.status(400).json({ error: "familyId and a positive amountRupees are required" });
+  }
+  try {
+    const order = await razorpay.orders.create({
+      amount: Math.round(amountRupees * 100), // paise
+      currency: "INR",
+      receipt: `topup_${familyId}_${Date.now()}`,
+      notes: { familyId },
+    });
+    res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (err) {
+    console.error("Razorpay order creation failed:", err);
+    res.status(500).json({ error: "failed to create order" });
+  }
+});
+
+app.post("/api/wallet/verify-payment", (req, res) => {
+  const { familyId, razorpay_order_id, razorpay_payment_id, razorpay_signature, amountRupees } = req.body || {};
+  if (!familyId || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amountRupees) {
+    return res.status(400).json({ error: "missing required fields" });
+  }
+  const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+  const expectedSignature = crypto
+    .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+    .update(body)
+    .digest("hex");
+
+  if (expectedSignature !== razorpay_signature) {
+    return res.status(400).json({ error: "invalid payment signature" });
+  }
+
+  const newBalance = creditWallet(familyId, Math.round(amountRupees * 100));
+  res.json({ ok: true, balancePaise: newBalance });
+});
+
+app.get("/api/wallet/balance", (req, res) => {
+  const familyId = (req.query.familyId || "").toString().trim().toUpperCase();
+  if (!familyId) return res.status(400).json({ error: "familyId query param is required" });
+  res.json({ familyId, balancePaise: getBalance(familyId), callCostPaise: CALL_COST_PAISE });
 });
 
 // --- Alerts ---
@@ -262,7 +365,7 @@ app.post("/alert", async (req, res) => {
 
   if (classification.confirmedSeverity === "crisis") {
     const { devicePhoneNumber, counselorPhone } = req.body || {};
-    triggerWellbeingCall(devicePhoneNumber, counselorPhone, "your trusted contact")
+    triggerWellbeingCall(devicePhoneNumber, counselorPhone, "your trusted contact", familyId)
       .then((result) => console.log("Call trigger result:", result))
       .catch((err) => console.error("Call trigger threw:", err));
   }
@@ -346,6 +449,7 @@ app.get("/uninstall-alert", async (req, res) => {
   }
   res.send("OK");
 });
+
 // --- Concern phrase patterns (remotely updatable) ---
 const PATTERNS_PATH = path.join(__dirname, "patterns.json");
 const DEFAULT_PATTERNS = [
@@ -379,7 +483,6 @@ function loadPatterns() {
   try {
     return JSON.parse(fs.readFileSync(PATTERNS_PATH, "utf-8"));
   } catch {
-    // First run: seed the file so it's editable going forward without touching code.
     fs.writeFileSync(PATTERNS_PATH, JSON.stringify(DEFAULT_PATTERNS, null, 2));
     return DEFAULT_PATTERNS;
   }
@@ -406,7 +509,7 @@ app.post("/api/patterns", (req, res) => {
   res.json({ ok: true, patterns });
 });
 
-// --- Family devices (no session needed — the family code itself is the shared secret the app already has) ---
+// --- Family devices ---
 app.get("/api/devices", (req, res) => {
   const familyId = (req.query.familyId || "").toString().trim().toUpperCase();
   if (!familyId) return res.status(400).json({ error: "familyId query param is required" });
