@@ -19,6 +19,7 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const lastSent = new Map();
 const MIN_INTERVAL_MS = 2 * 60 * 1000;
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-secret-change-me-in-render";
+const BASE_URL = "https://safety-extension-backend.onrender.com";
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -76,6 +77,19 @@ function debitWallet(familyId, amountPaise) {
   wallets[familyId].balancePaise = current - amountPaise;
   saveWallets(wallets);
   return { ok: true, balancePaise: wallets[familyId].balancePaise };
+}
+
+// --- Pending top-ups (maps a Razorpay Payment Link ID to the family/amount it's for) ---
+const PENDING_TOPUPS_PATH = path.join(__dirname, "pending-topups.json");
+function loadPendingTopups() {
+  try {
+    return JSON.parse(fs.readFileSync(PENDING_TOPUPS_PATH, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function savePendingTopups(pending) {
+  fs.writeFileSync(PENDING_TOPUPS_PATH, JSON.stringify(pending, null, 2));
 }
 
 // --- Groq-based risk classification (confirms/refines the on-device regex match) ---
@@ -293,97 +307,93 @@ app.get("/api/family/summary", (req, res) => {
   });
 });
 
-// --- Wallet endpoints ---
-app.post("/api/wallet/create-order", async (req, res) => {
+// --- Wallet: Payment Link based top-up (no webhook needed) ---
+app.post("/api/wallet/create-payment-link", async (req, res) => {
   const { familyId, amountRupees } = req.body || {};
   if (!familyId || !amountRupees || amountRupees <= 0) {
     return res.status(400).json({ error: "familyId and a positive amountRupees are required" });
   }
   try {
-    const order = await razorpay.orders.create({
+    const paymentLink = await razorpay.paymentLink.create({
       amount: Math.round(amountRupees * 100),
       currency: "INR",
-      receipt: `topup_${familyId}_${Date.now()}`,
-      notes: { familyId },
+      accept_partial: false,
+      description: "Clot wallet top-up",
+      notify: { sms: false, email: false },
+      reminder_enable: false,
+      callback_url: `${BASE_URL}/api/wallet/payment-callback`,
+      callback_method: "get",
     });
-    res.json({
-      orderId: order.id,
-      amount: order.amount,
-      currency: order.currency,
-      keyId: process.env.RAZORPAY_KEY_ID,
-    });
+
+    const pending = loadPendingTopups();
+    pending[paymentLink.id] = { familyId, amountRupees, createdAt: new Date().toISOString() };
+    savePendingTopups(pending);
+
+    res.json({ shortUrl: paymentLink.short_url, paymentLinkId: paymentLink.id });
   } catch (err) {
-    console.error("Razorpay order creation failed:", err);
-    res.status(500).json({ error: "failed to create order" });
+    console.error("Payment link creation failed:", err);
+    res.status(500).json({ error: "failed to create payment link" });
   }
 });
 
-app.post("/api/wallet/verify-payment", (req, res) => {
-  const { familyId, razorpay_order_id, razorpay_payment_id, razorpay_signature, amountRupees } = req.body || {};
-  if (!familyId || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amountRupees) {
-    return res.status(400).json({ error: "missing required fields" });
+app.get("/api/wallet/payment-callback", (req, res) => {
+  const {
+    razorpay_payment_id,
+    razorpay_payment_link_id,
+    razorpay_payment_link_reference_id,
+    razorpay_payment_link_status,
+    razorpay_signature,
+  } = req.query;
+
+  const sendPage = (message, ok) => {
+    res.set("Content-Type", "text/html");
+    res.send(`<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:sans-serif;background:#1A1F33;color:white;text-align:center;padding-top:80px;">
+<h2>${ok ? "✅ Payment received" : "⚠️ Something went wrong"}</h2>
+<p>${message}</p>
+<p style="opacity:0.7;">You can close this tab and return to the app.</p>
+</body></html>`);
+  };
+
+  if (!razorpay_payment_id || !razorpay_payment_link_id || !razorpay_signature) {
+    return sendPage("Missing payment details.", false);
   }
-  const body = `${razorpay_order_id}|${razorpay_payment_id}`;
+
+  const referenceId = razorpay_payment_link_reference_id || "";
+  const payload = `${razorpay_payment_link_id}|${referenceId}|${razorpay_payment_link_status}|${razorpay_payment_id}`;
   const expectedSignature = crypto
     .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-    .update(body)
+    .update(payload)
     .digest("hex");
 
   if (expectedSignature !== razorpay_signature) {
-    return res.status(400).json({ error: "invalid payment signature" });
+    return sendPage("Payment verification failed.", false);
   }
 
-  const newBalance = creditWallet(familyId, Math.round(amountRupees * 100));
-  res.json({ ok: true, balancePaise: newBalance });
+  if (razorpay_payment_link_status !== "paid") {
+    return sendPage("Payment was not completed.", false);
+  }
+
+  const pending = loadPendingTopups();
+  const entry = pending[razorpay_payment_link_id];
+
+  if (!entry) {
+    // Already processed earlier, or unknown link — avoid double-crediting
+    return sendPage("Your wallet has already been updated.", true);
+  }
+
+  creditWallet(entry.familyId, Math.round(entry.amountRupees * 100));
+  delete pending[razorpay_payment_link_id];
+  savePendingTopups(pending);
+
+  sendPage(`₹${entry.amountRupees} added to your wallet.`, true);
 });
 
 app.get("/api/wallet/balance", (req, res) => {
   const familyId = (req.query.familyId || "").toString().trim().toUpperCase();
   if (!familyId) return res.status(400).json({ error: "familyId query param is required" });
   res.json({ familyId, balancePaise: getBalance(familyId), callCostPaise: CALL_COST_PAISE });
-});
-
-// --- Razorpay checkout page (served here so the WebView loads a real HTTPS
-// URL instead of injected inline HTML — avoids WebView relative-URL bugs) ---
-app.get("/checkout", (req, res) => {
-  const { key, order_id, amount, currency } = req.query;
-  if (!key || !order_id || !amount || !currency) {
-    return res.status(400).send("Missing required parameters");
-  }
-  res.set("Content-Type", "text/html");
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
-</head>
-<body style="margin:0;padding:0;background:#1A1F33;">
-<script>
-  var options = {
-    "key": "${key}",
-    "amount": "${amount}",
-    "currency": "${currency}",
-    "name": "Clot",
-    "description": "Wallet top-up for wellbeing call alerts",
-    "order_id": "${order_id}",
-    "handler": function (response){
-      AndroidBridge.onPaymentSuccess(response.razorpay_payment_id, response.razorpay_order_id, response.razorpay_signature);
-    },
-    "modal": {
-      "ondismiss": function(){
-        AndroidBridge.onPaymentCancelled();
-      }
-    },
-    "theme": { "color": "#1E2761" }
-  };
-  var rzp = new Razorpay(options);
-  rzp.on('payment.failed', function (response){
-    AndroidBridge.onPaymentFailed(response.error.description || "Payment failed");
-  });
-  rzp.open();
-</script>
-</body>
-</html>`);
 });
 
 // --- Alerts ---
