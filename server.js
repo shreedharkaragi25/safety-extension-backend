@@ -165,7 +165,6 @@ async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedCo
     if (!response.ok) {
       const errText = await response.text();
       console.error("Vapi call trigger failed:", response.status, errText);
-      // Refund since the call didn't actually go through
       if (familyId) creditWallet(familyId, CALL_COST_PAISE);
       return { skipped: false, error: errText };
     }
@@ -209,7 +208,7 @@ function generateFamilyCode() {
   return crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6);
 }
 function signSession(familyId) {
-  const expiry = Date.now() + 1000 * 60 * 60 * 24 * 7; // 7 days
+  const expiry = Date.now() + 1000 * 60 * 60 * 24 * 7;
   const payload = `${familyId}.${expiry}`;
   const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
   return `${payload}.${sig}`;
@@ -302,7 +301,7 @@ app.post("/api/wallet/create-order", async (req, res) => {
   }
   try {
     const order = await razorpay.orders.create({
-      amount: Math.round(amountRupees * 100), // paise
+      amount: Math.round(amountRupees * 100),
       currency: "INR",
       receipt: `topup_${familyId}_${Date.now()}`,
       notes: { familyId },
@@ -342,6 +341,49 @@ app.get("/api/wallet/balance", (req, res) => {
   const familyId = (req.query.familyId || "").toString().trim().toUpperCase();
   if (!familyId) return res.status(400).json({ error: "familyId query param is required" });
   res.json({ familyId, balancePaise: getBalance(familyId), callCostPaise: CALL_COST_PAISE });
+});
+
+// --- Razorpay checkout page (served here so the WebView loads a real HTTPS
+// URL instead of injected inline HTML — avoids WebView relative-URL bugs) ---
+app.get("/checkout", (req, res) => {
+  const { key, order_id, amount, currency } = req.query;
+  if (!key || !order_id || !amount || !currency) {
+    return res.status(400).send("Missing required parameters");
+  }
+  res.set("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head>
+<body style="margin:0;padding:0;background:#1A1F33;">
+<script>
+  var options = {
+    "key": "${key}",
+    "amount": "${amount}",
+    "currency": "${currency}",
+    "name": "Clot",
+    "description": "Wallet top-up for wellbeing call alerts",
+    "order_id": "${order_id}",
+    "handler": function (response){
+      AndroidBridge.onPaymentSuccess(response.razorpay_payment_id, response.razorpay_order_id, response.razorpay_signature);
+    },
+    "modal": {
+      "ondismiss": function(){
+        AndroidBridge.onPaymentCancelled();
+      }
+    },
+    "theme": { "color": "#1E2761" }
+  };
+  var rzp = new Razorpay(options);
+  rzp.on('payment.failed', function (response){
+    AndroidBridge.onPaymentFailed(response.error.description || "Payment failed");
+  });
+  rzp.open();
+</script>
+</body>
+</html>`);
 });
 
 // --- Alerts ---
