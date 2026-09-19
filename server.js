@@ -47,7 +47,7 @@ function saveAlert(record) {
 
 // --- Wallet store (per family) ---
 const WALLETS_PATH = path.join(__dirname, "wallets.json");
-const CALL_COST_PAISE = 500; // ₹5 per wellbeing call, adjust as needed
+const CALL_COST_PAISE = 500; // ₹5 per wellbeing/escalation call, adjust as needed
 
 function loadWallets() {
   try {
@@ -139,17 +139,29 @@ async function classifyRisk(searchQuery) {
   }
 }
 
-// --- Vapi call trigger (only fires on confirmed crisis-level risk AND sufficient wallet balance) ---
+// --- Vapi: trusted-contact language -> assistant ID map ---
+// One assistant per language, all using Vapi's built-in "Primary language" voice
+// setting (same Elliot voice, different language) rather than a separate voice provider.
+const TRUSTED_CONTACT_ASSISTANT_MAP = {
+  en: "5c364c07-d35f-484c-b9f2-a948912bdea6",
+  hi: "dd0b7a79-834e-425e-b6dc-1db21e7aa8d3",
+  kn: "7ad544e8-89d8-4c29-a5d2-dc3856457b01",
+  ta: "eb728c91-ee8f-44be-ac61-605888af332c",
+  te: "84374d81-0394-41b5-9495-50504cf3ac3e",
+};
+
+// --- Vapi call trigger: device user's own wellbeing check-in + counselor handoff ---
+// (only fires on confirmed crisis-level risk AND sufficient wallet balance)
 async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedContactName, familyId) {
   if (!devicePhoneNumber) {
-    console.log("No devicePhoneNumber provided, skipping Vapi call trigger.");
+    console.log("No devicePhoneNumber provided, skipping Vapi wellbeing call trigger.");
     return { skipped: true, reason: "no device phone number" };
   }
 
   if (familyId) {
     const debit = debitWallet(familyId, CALL_COST_PAISE);
     if (!debit.ok) {
-      console.log(`Insufficient wallet balance for family ${familyId}, skipping call. Balance: ${debit.balancePaise} paise`);
+      console.log(`Insufficient wallet balance for family ${familyId}, skipping wellbeing call. Balance: ${debit.balancePaise} paise`);
       return { skipped: true, reason: "insufficient wallet balance", balancePaise: debit.balancePaise };
     }
   }
@@ -178,16 +190,75 @@ async function triggerWellbeingCall(devicePhoneNumber, counselorPhone, trustedCo
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error("Vapi call trigger failed:", response.status, errText);
+      console.error("Vapi wellbeing call trigger failed:", response.status, errText);
       if (familyId) creditWallet(familyId, CALL_COST_PAISE);
       return { skipped: false, error: errText };
     }
 
     const data = await response.json();
-    console.log("Vapi call triggered successfully:", data.id || data);
+    console.log("Vapi wellbeing call triggered successfully:", data.id || data);
     return { skipped: false, callId: data.id };
   } catch (err) {
     console.error("triggerWellbeingCall failed:", err);
+    if (familyId) creditWallet(familyId, CALL_COST_PAISE);
+    return { skipped: false, error: err.message };
+  }
+}
+
+// --- Vapi call trigger: trusted contact escalation call, in their preferred language ---
+// (separate wallet debit from the device wellbeing call — each call the family pays for
+// is charged independently, so one call succeeding/failing doesn't affect the other)
+async function triggerTrustedContactCall(trustedContactPhone, preferredLanguage, deviceOwnerLabel, searchQuery, riskLevel, familyId) {
+  if (!trustedContactPhone) {
+    console.log("No trustedContactPhone provided, skipping Vapi trusted-contact call trigger.");
+    return { skipped: true, reason: "no trusted contact phone number" };
+  }
+
+  const lang = (preferredLanguage || "en").toLowerCase();
+  const assistantId = TRUSTED_CONTACT_ASSISTANT_MAP[lang] || TRUSTED_CONTACT_ASSISTANT_MAP.en;
+
+  if (familyId) {
+    const debit = debitWallet(familyId, CALL_COST_PAISE);
+    if (!debit.ok) {
+      console.log(`Insufficient wallet balance for family ${familyId}, skipping trusted-contact call. Balance: ${debit.balancePaise} paise`);
+      return { skipped: true, reason: "insufficient wallet balance", balancePaise: debit.balancePaise };
+    }
+  }
+
+  try {
+    const response = await fetch("https://api.vapi.ai/call", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.VAPI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        assistantId,
+        customer: {
+          number: trustedContactPhone,
+        },
+        assistantOverrides: {
+          variableValues: {
+            deviceOwnerLabel: deviceOwnerLabel || "a family device",
+            searchQuery: searchQuery || "",
+            riskLevel: riskLevel || "crisis",
+          },
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Vapi trusted-contact call trigger failed:", response.status, errText);
+      if (familyId) creditWallet(familyId, CALL_COST_PAISE);
+      return { skipped: false, error: errText };
+    }
+
+    const data = await response.json();
+    console.log(`Vapi trusted-contact call triggered successfully (lang=${lang}):`, data.id || data);
+    return { skipped: false, callId: data.id, language: lang };
+  } catch (err) {
+    console.error("triggerTrustedContactCall failed:", err);
     if (familyId) creditWallet(familyId, CALL_COST_PAISE);
     return { skipped: false, error: err.message };
   }
@@ -379,7 +450,6 @@ app.get("/api/wallet/payment-callback", (req, res) => {
   const entry = pending[razorpay_payment_link_id];
 
   if (!entry) {
-    // Already processed earlier, or unknown link — avoid double-crediting
     return sendPage("Your wallet has already been updated.", true);
   }
 
@@ -398,7 +468,20 @@ app.get("/api/wallet/balance", (req, res) => {
 
 // --- Alerts ---
 app.post("/alert", async (req, res) => {
-  const { contactEmail, deviceOwnerLabel, timestamp, searchQuery, location, mapLink, severity, familyId } = req.body || {};
+  const {
+    contactEmail,
+    deviceOwnerLabel,
+    timestamp,
+    searchQuery,
+    location,
+    mapLink,
+    severity,
+    familyId,
+    devicePhoneNumber,
+    counselorPhone,
+    trustedContactPhone,
+    preferredLanguage,
+  } = req.body || {};
   if (!contactEmail) {
     return res.status(400).json({ error: "contactEmail is required" });
   }
@@ -413,13 +496,17 @@ app.post("/alert", async (req, res) => {
   const locationLine = mapLink ? `\nApproximate location: ${mapLink}\n` : "";
   const classification = await classifyRisk(searchQuery);
   console.log(`Groq classification for "${searchQuery}": ${classification.confirmedSeverity} (${classification.reason})`);
-  const isCrisis = severity === "crisis";
 
-  if (classification.confirmedSeverity === "crisis") {
-    const { devicePhoneNumber, counselorPhone } = req.body || {};
+  const isCrisis = classification.confirmedSeverity === "crisis";
+
+  if (isCrisis) {
     triggerWellbeingCall(devicePhoneNumber, counselorPhone, "your trusted contact", familyId)
-      .then((result) => console.log("Call trigger result:", result))
-      .catch((err) => console.error("Call trigger threw:", err));
+      .then((result) => console.log("Wellbeing call trigger result:", result))
+      .catch((err) => console.error("Wellbeing call trigger threw:", err));
+
+    triggerTrustedContactCall(trustedContactPhone, preferredLanguage, deviceOwnerLabel, searchQuery, classification.confirmedSeverity, familyId)
+      .then((result) => console.log("Trusted-contact call trigger result:", result))
+      .catch((err) => console.error("Trusted-contact call trigger threw:", err));
   }
 
   const subjectLine = isCrisis
