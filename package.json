@@ -12,6 +12,7 @@
     "express": "^4.19.2",
     "nodemailer": "^6.9.13",
     "razorpay": "^2.9.8",
-    "resend": "^6.24.0"
+    "resend": "^6.24.0",
+    "twilio": "^6.1.1"
   }
 }

@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import Razorpay from "razorpay";
+import twilio from "twilio";
 import { fileURLToPath } from "url";
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -25,6 +26,11 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+const twilioClient =
+  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+    : null;
 
 // --- Alert history store ---
 const STORE_PATH = path.join(__dirname, "alerts.json");
@@ -139,6 +145,54 @@ async function classifyRisk(searchQuery) {
   }
 }
 
+// --- Twilio WhatsApp alert (sandbox — trusted contact must have sent the join code) ---
+async function sendWhatsAppAlert(trustedContactPhone, deviceOwnerLabel, searchQuery, mapLink, isCrisis) {
+  if (!twilioClient) {
+    console.log("Twilio not configured (missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN), skipping WhatsApp alert.");
+    return { skipped: true, reason: "twilio not configured" };
+  }
+  if (!trustedContactPhone) {
+    console.log("No trustedContactPhone provided, skipping WhatsApp alert.");
+    return { skipped: true, reason: "no trusted contact phone number" };
+  }
+  if (!process.env.TWILIO_WHATSAPP_NUMBER) {
+    console.log("TWILIO_WHATSAPP_NUMBER not set, skipping WhatsApp alert.");
+    return { skipped: true, reason: "no sandbox number configured" };
+  }
+
+  const deviceLine = deviceOwnerLabel ? ` on "${deviceOwnerLabel}"` : "";
+  const urgencyLine = isCrisis
+    ? "This matched language associated with a possible safety risk. Please reach out soon."
+    : "This matched language associated with stress or low mood. A gentle check-in may help.";
+  const queryLine = searchQuery ? `\nSearch: "${searchQuery}"` : "";
+  const locationLine = mapLink ? `\nLocation: ${mapLink}` : "";
+
+  const body =
+    `⚠️ Clot check-in alert\n\n` +
+    `A concerning search was made${deviceLine}.` +
+    queryLine +
+    locationLine +
+    `\n\n${urgencyLine}\n\n` +
+    `This is automated, not a diagnosis. Support: https://findahelpline.com`;
+
+  const toNumber = trustedContactPhone.startsWith("whatsapp:")
+    ? trustedContactPhone
+    : `whatsapp:${trustedContactPhone}`;
+
+  try {
+    const message = await twilioClient.messages.create({
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
+      to: toNumber,
+      body,
+    });
+    console.log("WhatsApp alert sent:", message.sid);
+    return { skipped: false, sid: message.sid };
+  } catch (err) {
+    console.error("sendWhatsAppAlert failed:", err.message);
+    return { skipped: false, error: err.message };
+  }
+}
+
 // --- Vapi: trusted-contact language -> assistant ID map ---
 // One assistant per language, all using Vapi's built-in "Primary language" voice
 // setting (same Elliot voice, different language) rather than a separate voice provider.
@@ -146,7 +200,7 @@ const TRUSTED_CONTACT_ASSISTANT_MAP = {
   en: "5c364c07-d35f-484c-b9f2-a948912bdea6",
   hi: "dd0b7a79-834e-425e-b6dc-1db21e7aa8d3",
   kn: "7ad544e8-89d8-4c29-a5d2-dc3856457b01",
-  ta: "eb728c91-ee8f-44be-ac61-605888af332c",
+  ta: "eb728c91-ee8f-484c-b6dc-1db21e7aa8d3",
   te: "84374d81-0394-41b5-9495-50504cf3ac3e",
 };
 
@@ -508,6 +562,10 @@ app.post("/alert", async (req, res) => {
       .then((result) => console.log("Trusted-contact call trigger result:", result))
       .catch((err) => console.error("Trusted-contact call trigger threw:", err));
   }
+
+  sendWhatsAppAlert(trustedContactPhone, deviceOwnerLabel, searchQuery, mapLink, isCrisis)
+    .then((result) => console.log("WhatsApp alert result:", result))
+    .catch((err) => console.error("WhatsApp alert threw:", err));
 
   const subjectLine = isCrisis
     ? "Check-in: a concerning search was detected"
